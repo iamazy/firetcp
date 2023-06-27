@@ -3,12 +3,8 @@ use std::ops::Range;
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::{
-    checksum,
-    error::FireResult,
-    ethernet::EthernetFrame,
-    ip::{IpPacket, IpProtocol},
-    ipv4::Address,
-    socket::channel,
+    checksum, error::FireResult, ethernet::EthernetFrame, ipv4::Address, socket::channel,
+    EtherType, FireError, IpProtocol, Ipv4Packet,
 };
 
 /// **User Datagram Protocol** (**UDP**) is one of the core communication protocols of the Internet
@@ -30,6 +26,7 @@ use crate::{
 /// packets delayed due to retransmission, which may not be an option in a real-time system.
 ///
 /// See also [UDP Datagram Header](https://en.wikipedia.org/wiki/User_Datagram_Protocol#UDP_datagram_structure)
+#[derive(Debug)]
 pub struct UdpPacket {
     buffer: BytesMut,
 }
@@ -41,6 +38,7 @@ impl UdpPacket {
     const DST_PORT: Range<usize> = 2..4;
     const PKT_LEN: Range<usize> = 4..6;
     const CHECKSUM: Range<usize> = 6..8;
+    const HEADER_LEN: usize = Self::CHECKSUM.end;
 
     pub fn new(
         source_ip_addr: Address,
@@ -61,6 +59,35 @@ impl UdpPacket {
         udp.set_payload(payload);
         udp.fill_checksum(&source_ip_addr, &target_ip_addr);
         udp
+    }
+
+    /// Shorthand for a combination of [new_unchecked] and [check_len].
+    ///
+    /// [new_unchecked]: #method.new_unchecked
+    /// [check_len]: #method.check_len
+    pub fn new_checked(buffer: &[u8]) -> FireResult<Self> {
+        let buffer = BytesMut::from(buffer);
+        let packet = Self { buffer };
+        packet.check_len()?;
+        Ok(packet)
+    }
+
+    /// Ensure that no accessor method will panic if called.
+    /// Returns `Err(BufferTooShort)` if the buffer is too short.
+    /// Returns `Err(BufferTooShort)` if the length field has a value smaller
+    /// than the header length.
+    pub fn check_len(&self) -> FireResult<()> {
+        let buffer_len = self.buffer.as_ref().len();
+        if buffer_len < Self::HEADER_LEN {
+            Err(FireError::BufferTooShort)
+        } else {
+            let field_len = self.len();
+            if buffer_len < field_len || field_len < Self::HEADER_LEN {
+                Err(FireError::BufferTooShort)
+            } else {
+                Ok(())
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -168,10 +195,10 @@ impl UdpPacket {
     pub fn send(
         &self,
         frame: EthernetFrame,
-        ip_packet: IpPacket,
+        ip_packet: Ipv4Packet,
         ifindex: usize,
     ) -> FireResult<()> {
-        let (sender, _) = channel(ifindex, frame.source_mac_address())?;
+        let (sender, _) = channel(EtherType::Ipv4, ifindex, frame.source_mac_address())?;
 
         let mut packet = vec![];
         packet.extend_from_slice(frame.as_ref());

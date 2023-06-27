@@ -1,20 +1,14 @@
 use std::ops::Range;
 
 use bytes::{BufMut, BytesMut};
-use nix::{
-    sys::socket::{
-        bind, recvfrom, sendto, socket, AddressFamily, LinkAddr, MsgFlags, SockFlag, SockProtocol,
-        SockType, SockaddrLike, SockaddrStorage,
-    },
-    unistd::close,
-};
 use tracing::debug;
 
 use crate::{
     error::FireResult,
     ethernet::{EtherType, EthernetAddress, EthernetFrame},
     ipv4::Address,
-    FireError,
+    socket::channel,
+    FireError, NetworkInterface,
 };
 
 /// The Address Resolution Protocol (ARP) is a communication protocol used for discovering the link
@@ -66,9 +60,11 @@ impl Arp {
     }
 
     pub fn new(
-        mac_addr: EthernetAddress,
+        source_mac_addr: EthernetAddress,
         source_ip_addr: Address,
+        target_mac_addr: EthernetAddress,
         target_ip_addr: Address,
+        op: OpCode,
     ) -> FireResult<Self> {
         let mut buffer = BytesMut::with_capacity(28);
         // hardware type
@@ -80,13 +76,13 @@ impl Arp {
         // protocol len
         buffer.put_u8(4);
         // operation
-        buffer.put_slice(&OpCode::Request.to_bytes());
+        buffer.put_slice(&op.to_bytes());
         // source hardware addr
-        buffer.put_slice(mac_addr.as_bytes());
+        buffer.put_slice(source_mac_addr.as_bytes());
         // source protocol addr
         buffer.put_slice(source_ip_addr.as_bytes());
         // target hardware addr
-        buffer.put_slice(&[0x00; 6]);
+        buffer.put_slice(target_mac_addr.as_bytes());
         // target protocol addr
         buffer.put_slice(target_ip_addr.as_bytes());
 
@@ -95,7 +91,33 @@ impl Arp {
         Ok(arp)
     }
 
-    fn new_checked(packet: &[u8]) -> FireResult<Self> {
+    pub fn new_gratuitous(
+        source_mac_addr: EthernetAddress,
+        source_ip_addr: Address,
+    ) -> FireResult<Self> {
+        Self::new(
+            source_mac_addr,
+            source_ip_addr,
+            EthernetAddress::BROADCAST,
+            source_ip_addr,
+            OpCode::Reply,
+        )
+    }
+
+    pub fn new_announcement(
+        source_mac_addr: EthernetAddress,
+        source_ip_addr: Address,
+    ) -> FireResult<Self> {
+        Self::new(
+            source_mac_addr,
+            source_ip_addr,
+            EthernetAddress::BROADCAST,
+            source_ip_addr,
+            OpCode::Request,
+        )
+    }
+
+    pub fn new_checked(packet: &[u8]) -> FireResult<Self> {
         let buffer = BytesMut::from(packet);
         let arp = Arp { buffer };
         arp.check_len()?;
@@ -175,6 +197,12 @@ impl Arp {
         EthernetAddress::from_bytes(addr)
     }
 
+    pub fn set_source_hardware_address(&mut self, addr: EthernetAddress) {
+        let sha = Self::SHA(self.hardware_len(), self.protocol_len());
+        let data = self.buffer.as_mut();
+        (&mut data[sha]).put_slice(addr.as_bytes());
+    }
+
     /// Internetwork address of the sender (SPA).
     pub fn source_protocol_address(&self) -> Address {
         let addr = &self.buffer[Self::SPA(self.hardware_len(), self.protocol_len())];
@@ -189,6 +217,12 @@ impl Arp {
         EthernetAddress::from_bytes(addr)
     }
 
+    pub fn set_target_hardware_address(&mut self, addr: EthernetAddress) {
+        let tha = Self::THA(self.hardware_len(), self.protocol_len());
+        let data = self.buffer.as_mut();
+        (&mut data[tha]).put_slice(addr.as_bytes());
+    }
+
     /// Internetwork address of the intended receiver (TPA, 4 bytes).
     pub fn target_protocol_address(&self) -> Address {
         let addr = &self.buffer[Self::TPA(self.hardware_len(), self.protocol_len())];
@@ -201,83 +235,43 @@ impl Arp {
             && self.target_protocol_address() == reply.source_protocol_address()
     }
 
-    pub fn send(&self, ethernet: EthernetFrame, iface_index: usize) -> FireResult<Option<Self>> {
-        let send_fd = socket(
-            AddressFamily::Packet,
-            SockType::Raw,
-            SockFlag::empty(),
-            SockProtocol::EthAll,
-        )?;
-        // sockaddr_ll is a device-independent physical-layer (data link layer) address.
-        //
-        // [Further reading](https://man7.org/linux/man-pages/man7/packet.7.html)
-        let mut sockaddr = nix::libc::sockaddr_ll {
-            // Always AF_PACKET
-            sll_family: nix::libc::AF_PACKET as nix::libc::sa_family_t,
-            // Physical-layer protocol
-            sll_protocol: (nix::libc::ETH_P_ALL as u16).to_be(),
-            // interface number
-            sll_ifindex: iface_index as i32,
-            // ARP hardware type
-            sll_hatype: 0,
-            // Packet type
-            sll_pkttype: 0,
-            // Length of MAC address
-            sll_halen: 6,
-            // Physical-layer address [MAC]
-            sll_addr: [0; 8],
-        };
-        sockaddr.sll_addr[..6].copy_from_slice(ethernet.source_mac_address().as_bytes());
-        let addr = unsafe {
-            LinkAddr::from_raw(
-                &sockaddr as *const nix::libc::sockaddr_ll as *const nix::libc::sockaddr,
-                None,
-            )
-            .unwrap()
-        };
+    pub fn send(&mut self, iface: NetworkInterface) -> FireResult<Option<Self>> {
+        let frame = EthernetFrame::new(EthernetAddress::BROADCAST, iface.mac_addr, EtherType::Arp);
 
-        bind(send_fd, &addr)?;
+        let (sender, mut receiver) = channel(
+            EtherType::Arp,
+            iface.iface_index,
+            frame.source_mac_address(),
+        )?;
 
         let mut packet = vec![];
-        packet.extend_from_slice(ethernet.as_ref());
+        packet.extend_from_slice(frame.as_ref());
         packet.extend_from_slice(self.buffer.as_ref());
 
-        let ret = sendto(send_fd, &packet, &addr, MsgFlags::empty())?;
-        debug!("send arp request: {}, bufsize: {}", self, ret);
-
-        let mut recv_buf = vec![0; 4096];
-        while let Ok((ret, _addr)) = recvfrom::<SockaddrStorage>(send_fd, &mut recv_buf) {
-            if !recv_buf.is_empty() {
-                // # Received buffer Example
-                //
-                // ```ignore
-                // 0xffff 0xffff 0xffff        6 bytes, destination mac address
-                // 0x0000 0x0012 0x3010        6 bytes, source mac address
-                // 0x0806                      2 bytes, ether type, 0x0806 for arp
-                // 0x0001                      2 bytes, hardware type, 0x0001 for ethernet
-                // |--------------------------- 16 bytes ----------------------------|
-                // 0x0800                      2 bytes, protocol type
-                // 0x06                        1 byte, length of hardware address
-                // 0x04                        1 byte, length of protocol address
-                // 0x0001                      2 bytes, operation code, 0x0001 for request, 0x0002 for reply
-                // 0x0000 0x0012 0x3010        6 bytes, source hardware address
-                // 0x0202 0x0202               4 bytes, source protocol address
-                // |--------------------------- 16 bytes ----------------------------|
-                // 0x0000 0x0000 0x0000        6 bytes, target hardware address
-                // 0x0202 0x0201               4 bytes, target protocol address
-                // ```
-                if recv_buf[12..14] == [0x08, 0x06] && recv_buf[20..22] == [0x00, 0x02] {
-                    let arp_reply = Self::new_checked(&recv_buf[14..])?;
-                    if self.check_reply(&arp_reply) {
-                        debug!("received arp reply: {}, bufsize: {}", arp_reply, ret);
-                        close(send_fd)?;
-                        return Ok(Some(arp_reply));
+        let ret = sender.sendto(packet)?;
+        match self.operation() {
+            OpCode::Request => {
+                debug!("send arp request: {}, bufsize: {}", self, ret);
+                loop {
+                    let (ret, _addr) = receiver.recvfrom()?;
+                    if ret > 0 {
+                        let frame = EthernetFrame::new_checked(&receiver.buf)?;
+                        if !matches!(frame.ether_type(), EtherType::Arp) {
+                            continue;
+                        }
+                        let arp = Arp::new_checked(frame.payload())?;
+                        if let OpCode::Reply = arp.operation() {
+                            debug!("received arp reply: {}, bufsize: {}", arp, ret);
+                            return Ok(Some(arp));
+                        }
                     }
                 }
             }
+            OpCode::Reply => {
+                debug!("send arp reply: {}, bufsize: {}", self, ret);
+                Ok(None)
+            }
         }
-
-        Ok(None)
     }
 }
 
