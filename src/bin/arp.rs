@@ -1,4 +1,4 @@
-use firetcp::{Arp, EtherType, EthernetAddress, EthernetFrame, FireResult};
+use firetcp::{Arp, EthernetAddress, FireResult, OpCode};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> FireResult<()> {
@@ -19,10 +19,15 @@ fn main() -> FireResult<()> {
 
     let ni = firetcp::get_local_ip_addr(Some(iface))?;
 
-    let frame = EthernetFrame::new(EthernetAddress::BROADCAST, ni.mac_addr, EtherType::Arp);
-    let arp_req = Arp::new(ni.mac_addr, ni.ip_addr.into(), target_ip.into())?;
+    let mut arp_req = Arp::new(
+        ni.mac_addr,
+        ni.ip_addr.into(),
+        EthernetAddress::BROADCAST,
+        target_ip.into(),
+        OpCode::Request,
+    )?;
 
-    let _ = arp_req.send(frame, ni.iface_index);
+    let _ = arp_req.send(ni);
 
     Ok(())
 }

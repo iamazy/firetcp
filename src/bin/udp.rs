@@ -1,6 +1,6 @@
 use firetcp::{
-    get_local_ip_addr, Arp, EtherType, EthernetAddress, EthernetFrame, FireResult, IpPacket,
-    IpProtocol, UdpPacket,
+    get_local_ip_addr, Arp, EtherType, EthernetAddress, EthernetFrame, FireResult, IpProtocol,
+    Ipv4Packet, OpCode, UdpPacket,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -28,10 +28,15 @@ fn main() -> FireResult<()> {
     let source_port: u16 = 42279;
     let target_port: u16 = 80;
 
-    let frame = EthernetFrame::new(EthernetAddress::BROADCAST, ni.mac_addr, EtherType::Arp);
-    let arp_req = Arp::new(frame.source_mac_address(), source_ip_addr, target_ip_addr)?;
+    let mut arp_req = Arp::new(
+        ni.mac_addr,
+        source_ip_addr,
+        EthernetAddress::EMPTY,
+        target_ip_addr,
+        OpCode::Request,
+    )?;
 
-    let arp_reply = arp_req.send(frame, ni.iface_index)?.unwrap();
+    let arp_reply = arp_req.send(ni)?.unwrap();
     let frame = EthernetFrame::new(
         arp_reply.source_hardware_address(),
         ni.mac_addr,
@@ -46,7 +51,7 @@ fn main() -> FireResult<()> {
         b"foobar",
     );
 
-    let ip_packet = IpPacket::new(
+    let ip_packet = Ipv4Packet::new(
         source_ip_addr,
         target_ip_addr,
         IpProtocol::Udp,
