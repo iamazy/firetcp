@@ -4,11 +4,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use tracing::debug;
 
 use crate::{
-    checksum,
-    ethernet::EthernetFrame,
-    ip::{IpPacket, IpProtocol},
-    socket::channel,
-    FireError, FireResult,
+    checksum, ethernet::EthernetFrame, socket::channel, EtherType, FireError, FireResult,
+    IpProtocol, Ipv4Packet,
 };
 
 /// The Internet Control Message Protocol (ICMP) is a supporting protocol in the Internet protocol
@@ -19,11 +16,12 @@ use crate::{
 /// that it is not typically used to exchange data between systems, nor is it regularly employed by
 /// end-user network applications (with the exception of some diagnostic tools like ping and
 /// traceroute).
-pub struct Icmp {
+#[derive(Debug)]
+pub struct IcmpPacket {
     buffer: BytesMut,
 }
 
-impl AsRef<[u8]> for Icmp {
+impl AsRef<[u8]> for IcmpPacket {
     fn as_ref(&self) -> &[u8] {
         self.buffer.as_ref()
     }
@@ -104,7 +102,7 @@ impl Message<'_> {
     }
 }
 
-impl Icmp {
+impl IcmpPacket {
     const TYPE: usize = 0;
     const CODE: usize = 1;
     const CHECKSUM: Range<usize> = 2..4;
@@ -144,15 +142,15 @@ impl Icmp {
             }
         }
 
-        let mut icmp = Icmp::new_checked(&buffer)?;
+        let mut icmp = IcmpPacket::new_checked(&buffer)?;
         icmp.fill_checksum();
 
         Ok(icmp)
     }
 
-    fn new_checked(buffer: &[u8]) -> FireResult<Self> {
+    pub fn new_checked(buffer: &[u8]) -> FireResult<Self> {
         let buffer = BytesMut::from(buffer);
-        let icmp = Icmp { buffer };
+        let icmp = IcmpPacket { buffer };
         icmp.check_len()?;
         Ok(icmp)
     }
@@ -174,6 +172,16 @@ impl Icmp {
 
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
+    }
+
+    /// Return the header length.
+    /// The result depends on the value of the message type field.
+    pub fn header_len(&self) -> usize {
+        match self.message_type() {
+            MessageType::EchoRequest => Self::ECHO_SEQNO.end,
+            MessageType::EchoReply => Self::ECHO_SEQNO.end,
+            _ => Self::UNUSED.end,
+        }
     }
 
     /// Return the message type field.
@@ -262,6 +270,12 @@ impl Icmp {
         (&mut data[Self::ECHO_SEQNO]).put_u16(value)
     }
 
+    #[inline]
+    pub fn echo_data(&self) -> &[u8] {
+        let data = self.buffer.as_ref();
+        &data[self.header_len()..]
+    }
+
     /// Validate the header checksum.
     ///
     /// # Fuzzing
@@ -288,10 +302,10 @@ impl Icmp {
     pub fn send(
         &self,
         frame: EthernetFrame,
-        ip_packet: IpPacket,
+        ip_packet: Ipv4Packet,
         ifindex: usize,
     ) -> FireResult<Self> {
-        let (sender, mut receiver) = channel(ifindex, frame.source_mac_address())?;
+        let (sender, mut receiver) = channel(EtherType::Ipv4, ifindex, frame.source_mac_address())?;
 
         let mut packet = vec![];
         packet.extend_from_slice(frame.as_ref());
@@ -303,16 +317,27 @@ impl Icmp {
 
         loop {
             let (ret, _addr) = receiver.recvfrom()?;
-            if ret != 0 && receiver.buf[23] == IpProtocol::Icmp as u8 {
-                let reply = Self::new_checked(&receiver.buf[34..])?;
-                debug!("received icmp reply: {}, bufsize: {}", reply, ret);
-                return Ok(reply);
+            if ret > 0 {
+                assert!(ret >= 34, "Invalid ethernet packet");
+                let frame = EthernetFrame::new_checked(&receiver.buf)?;
+                if !matches!(frame.ether_type(), EtherType::Ipv4) {
+                    continue;
+                }
+
+                let ipv4 = Ipv4Packet::new_checked(frame.payload())?;
+                if !matches!(ipv4.protocol(), IpProtocol::Icmp) {
+                    continue;
+                }
+
+                let icmp_reply = IcmpPacket::new_checked(ipv4.payload())?;
+                debug!("received icmp reply: {icmp_reply}, bufsize: {ret}",);
+                return Ok(icmp_reply);
             }
         }
     }
 }
 
-impl std::fmt::Display for Icmp {
+impl std::fmt::Display for IcmpPacket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg_type = self.message_type();
         write!(
@@ -325,9 +350,10 @@ impl std::fmt::Display for Icmp {
             MessageType::EchoRequest | MessageType::EchoReply => {
                 write!(
                     f,
-                    ", ident: {}, sequence number: {}",
+                    ", ident: {}, sequence number: {}, data len: {}",
                     self.echo_ident(),
-                    self.echo_seq_no()
+                    self.echo_seq_no(),
+                    self.echo_data().len()
                 )?;
             }
             _ => {}

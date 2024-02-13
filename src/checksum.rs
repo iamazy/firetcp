@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut};
 
-use crate::{ip::IpProtocol, ipv4::Address};
+use crate::{ipv4::Address, IpProtocol};
 
 const fn propagate_carries(word: u32) -> u16 {
     let sum = (word >> 16) + (word & 0xffff);

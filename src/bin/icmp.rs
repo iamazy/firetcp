@@ -1,6 +1,6 @@
 use firetcp::{
-    get_local_ip_addr, Arp, EtherType, EthernetAddress, EthernetFrame, FireResult, Icmp, IpPacket,
-    IpProtocol, Message,
+    get_local_ip_addr, Arp, EtherType, EthernetAddress, EthernetFrame, FireResult, IcmpPacket,
+    IpProtocol, Ipv4Packet, Message, MessageType, OpCode,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -24,10 +24,15 @@ fn main() -> FireResult<()> {
     let source_ip_addr = ni.ip_addr.into();
     let target_ip_addr = target_ip.into();
 
-    let frame = EthernetFrame::new(EthernetAddress::BROADCAST, ni.mac_addr, EtherType::Arp);
-    let arp_req = Arp::new(frame.source_mac_address(), source_ip_addr, target_ip_addr)?;
+    let mut arp_req = Arp::new(
+        ni.mac_addr,
+        source_ip_addr,
+        EthernetAddress::EMPTY,
+        target_ip_addr,
+        OpCode::Request,
+    )?;
 
-    let arp_reply = arp_req.send(frame, ni.iface_index)?.unwrap();
+    let arp_reply = arp_req.send(ni)?.unwrap();
     let frame = EthernetFrame::new(
         arp_reply.source_hardware_address(),
         ni.mac_addr,
@@ -37,17 +42,20 @@ fn main() -> FireResult<()> {
     let msg = Message::EchoRequest {
         ident: 0,
         seq_no: 1,
-        data: "hello world".as_bytes(),
+        data: b"hello world",
     };
-    let icmp_packet = Icmp::new(msg)?;
-    let ip_packet = IpPacket::new(
+    let icmp_packet = IcmpPacket::new(msg)?;
+    let ip_packet = Ipv4Packet::new(
         source_ip_addr,
         target_ip_addr,
         IpProtocol::Icmp,
         icmp_packet.len(),
     );
 
-    let _ = icmp_packet.send(frame, ip_packet, ni.iface_index)?;
+    let icmp = icmp_packet.send(frame, ip_packet, ni.iface_index)?;
+    if MessageType::EchoReply == icmp.message_type() && icmp.message_code() == 0 {
+        assert_eq!(icmp.echo_data(), b"hello world");
+    }
 
     Ok(())
 }

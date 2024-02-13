@@ -1,5 +1,8 @@
-use bytes::{Bytes, BytesMut};
+use std::ops::{Range, RangeFrom};
 
+use bytes::BytesMut;
+
+use crate::{FireError, FireResult};
 /// A six-octet Ethernet II address.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct EthernetAddress([u8; 6]);
@@ -7,6 +10,8 @@ pub struct EthernetAddress([u8; 6]);
 impl EthernetAddress {
     /// The broadcast address.
     pub const BROADCAST: EthernetAddress = EthernetAddress([0xff; 6]);
+
+    pub const EMPTY: EthernetAddress = EthernetAddress([0x00; 6]);
 
     pub const fn len(&self) -> usize {
         self.0.len()
@@ -111,10 +116,17 @@ impl<'a> From<&'a [u8]> for EtherType {
 ///
 /// See also [EthernetFrame](https://en.wikipedia.org/wiki/Ethernet_frame)
 pub struct EthernetFrame {
-    buffer: Bytes,
+    buffer: BytesMut,
 }
 
 impl EthernetFrame {
+    const DESTINATION: Range<usize> = 0..6;
+    const SOURCE: Range<usize> = 6..12;
+    const ETHERTYPE: Range<usize> = 12..14;
+    const PAYLOAD: RangeFrom<usize> = 14..;
+    /// The Ethernet header length
+    const HEADER_LEN: usize = Self::PAYLOAD.start;
+
     pub fn new(
         dst_mac_addr: EthernetAddress,
         src_mac_addr: EthernetAddress,
@@ -124,23 +136,59 @@ impl EthernetFrame {
         buffer.extend_from_slice(dst_mac_addr.as_bytes());
         buffer.extend_from_slice(src_mac_addr.as_bytes());
         buffer.extend_from_slice(&ether_type.to_bytes());
-        Self {
-            buffer: buffer.freeze(),
+        Self { buffer }
+    }
+
+    /// Shorthand for a combination of [new_unchecked] and [check_len].
+    pub fn new_checked(buffer: &[u8]) -> FireResult<Self> {
+        let buffer = BytesMut::from(buffer);
+        let packet = Self { buffer };
+        packet.check_len()?;
+        Ok(packet)
+    }
+
+    /// Ensure that no accessor method will panic if called.
+    /// Returns `Err(Error)` if the buffer is too short.
+    pub fn check_len(&self) -> FireResult<()> {
+        let len = self.buffer.as_ref().len();
+        if len < Self::HEADER_LEN {
+            Err(FireError::BufferTooShort)
+        } else {
+            Ok(())
         }
     }
 
     /// Destination MAC address
     pub fn target_mac_address(&self) -> EthernetAddress {
-        EthernetAddress::from_bytes(&self.buffer[0..6])
+        EthernetAddress::from_bytes(&self.buffer[Self::DESTINATION])
     }
 
     /// Source MAC address
     pub fn source_mac_address(&self) -> EthernetAddress {
-        EthernetAddress::from_bytes(&self.buffer[6..12])
+        EthernetAddress::from_bytes(&self.buffer[Self::SOURCE])
     }
 
     pub fn ether_type(&self) -> EtherType {
-        self.buffer[12..].into()
+        self.buffer[Self::ETHERTYPE].into()
+    }
+
+    /// Return the length of a frame header.
+    pub const fn header_len() -> usize {
+        Self::HEADER_LEN
+    }
+
+    /// Return a pointer to the payload, without checking for 802.1Q.
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        let data = self.buffer.as_ref();
+        &data[Self::PAYLOAD]
+    }
+
+    /// Return a mutable pointer to the payload.
+    #[inline]
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        let data = self.buffer.as_mut();
+        &mut data[Self::PAYLOAD]
     }
 }
 

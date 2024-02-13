@@ -2,6 +2,7 @@ use nix::ifaddrs::getifaddrs;
 
 use crate::{error::FireResult, ethernet::EthernetAddress, FireError};
 
+#[derive(Clone, Copy)]
 pub struct NetworkInterface {
     pub mac_addr: EthernetAddress,
     pub ip_addr: u32,
